@@ -51,6 +51,9 @@ import {
   drawGreyBaseTile,
   drawBeachOnWater,
   drawFoundationPlot,
+  ZONE_COLORS,
+  ZONE_BORDER_COLORS,
+  GREY_TILE_COLORS,
 } from '@/components/game/drawing';
 import {
   getOverlayFillStyle,
@@ -1054,6 +1057,12 @@ export function CanvasIsometricGrid({ overlayMode, selectedTile, setSelectedTile
     const baseTileQueue = queues.baseTileQueue;
     const greenBaseTileQueue = queues.greenBaseTileQueue;
     const overlayQueue = queues.overlayQueue;
+
+    // Batch rendering collections for base tiles to avoid O(N) path fills
+    const fillBatches = new Map<string, number[]>(); // topColor -> [x, y, x, y, ...]
+    const strokeBatches = new Map<string, number[]>(); // strokeColor -> [x, y, x, y, ...]
+    const zoneBorderBatches = new Map<string, number[]>(); // strokeColor -> [x, y, x, y, ...]
+    const highlightBatch: number[] = []; // [x, y, x, y, ...]
     
     // PERF: Insertion sort for nearly-sorted arrays (O(n) vs O(n log n) for .sort())
     // Since tiles are iterated in diagonal order, queues are already nearly sorted
@@ -1146,8 +1155,8 @@ export function CanvasIsometricGrid({ overlayMode, selectedTile, setSelectedTile
     };
     
     
-    // Draw isometric tile base
-    function drawIsometricTile(ctx: CanvasRenderingContext2D, x: number, y: number, tile: Tile, highlight: boolean, currentZoom: number, skipGreyBase: boolean = false, skipGreenBase: boolean = false) {
+    // Queue isometric tile base for batch rendering
+    function queueIsometricTile(x: number, y: number, tile: Tile, highlight: boolean, currentZoom: number, skipGreyBase: boolean = false, skipGreenBase: boolean = false) {
       const w = TILE_WIDTH;
       const h = TILE_HEIGHT;
       
@@ -1209,53 +1218,40 @@ export function CanvasIsometricGrid({ overlayMode, selectedTile, setSelectedTile
       const shouldSkipDrawing = (skipGreenBase && (tile.building.type === 'grass' || tile.building.type === 'empty' || tile.building.type === 'tree')) || 
                                 tile.building.type === 'bridge';
       
-      // Draw the isometric diamond (top face)
       if (!shouldSkipDrawing) {
-        ctx.fillStyle = topColor;
-        ctx.beginPath();
-        ctx.moveTo(x + w / 2, y);
-        ctx.lineTo(x + w, y + h / 2);
-        ctx.lineTo(x + w / 2, y + h);
-        ctx.lineTo(x, y + h / 2);
-        ctx.closePath();
-        ctx.fill();
+        let fillList = fillBatches.get(topColor);
+        if (!fillList) {
+          fillList = [];
+          fillBatches.set(topColor, fillList);
+        }
+        fillList.push(x, y);
         
-        // Draw grid lines only when zoomed in (hide when zoom < 0.6)
         if (currentZoom >= 0.6) {
-          ctx.strokeStyle = strokeColor;
-          ctx.lineWidth = 0.5;
-          ctx.stroke();
+          let strokeList = strokeBatches.get(strokeColor);
+          if (!strokeList) {
+            strokeList = [];
+            strokeBatches.set(strokeColor, strokeList);
+          }
+          strokeList.push(x, y);
         }
         
-        // Draw zone border with dashed line (hide when zoomed out, only on grass/empty tiles - not on roads or buildings)
         if (tile.zone !== 'none' && 
             currentZoom >= 0.95 &&
             (tile.building.type === 'grass' || tile.building.type === 'empty')) {
-          ctx.strokeStyle = tile.zone === 'residential' ? '#22c55e' : 
-                            tile.zone === 'commercial' ? '#3b82f6' : '#f59e0b';
-          ctx.lineWidth = 1.5;
-          ctx.setLineDash([4, 2]);
-          ctx.stroke();
-          ctx.setLineDash([]);
+          const borderColor = tile.zone === 'residential' ? '#22c55e' : 
+                              tile.zone === 'commercial' ? '#3b82f6' : '#f59e0b';
+          let zoneList = zoneBorderBatches.get(borderColor);
+          if (!zoneList) {
+            zoneList = [];
+            zoneBorderBatches.set(borderColor, zoneList);
+          }
+          zoneList.push(x, y);
         }
       }
       
       // Highlight on hover/select (always draw, even if base was skipped)
       if (highlight) {
-        // Draw a semi-transparent fill for better visibility
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
-        ctx.beginPath();
-        ctx.moveTo(x + w / 2, y);
-        ctx.lineTo(x + w, y + h / 2);
-        ctx.lineTo(x + w / 2, y + h);
-        ctx.lineTo(x, y + h / 2);
-        ctx.closePath();
-        ctx.fill();
-        
-        // Draw white border
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 2;
-        ctx.stroke();
+        highlightBatch.push(x, y);
       }
     }
     
@@ -1698,10 +1694,10 @@ export function CanvasIsometricGrid({ overlayMode, selectedTile, setSelectedTile
         const needsGreenBaseOverWater = tileMetadata?.needsGreenBaseOverWater ?? false;
         const needsGreenBaseForPark = tileMetadata?.needsGreenBaseForPark ?? false;
         
-        // Draw base tile for all tiles (including water), but skip gray bases for buildings and green bases for grass/empty adjacent to water or parks
+        // Queue base tile for all tiles (including water), but skip gray bases for buildings and green bases for grass/empty adjacent to water or parks
         // Highlight subway stations when subway overlay is active
         const isSubwayStationHighlight = overlayMode === 'subway' && tile.building.type === 'subway_station';
-        drawIsometricTile(ctx, screenX, screenY, tile, !!(isInDragRect || isSubwayStationHighlight), zoom, true, needsGreenBaseOverWater || needsGreenBaseForPark);
+        queueIsometricTile(screenX, screenY, tile, !!(isInDragRect || isSubwayStationHighlight), zoom, true, needsGreenBaseOverWater || needsGreenBaseForPark);
         
         if (needsGreyBase) {
           baseTileQueue.push({ screenX, screenY, tile, depth: x + y });
@@ -1761,6 +1757,108 @@ export function CanvasIsometricGrid({ overlayMode, selectedTile, setSelectedTile
         }
       }
     }
+
+    // Render all batched flat ground base tiles in a single draw call per color
+    const w = TILE_WIDTH;
+    const h = TILE_HEIGHT;
+
+    // 1. Draw all filled base diamonds
+    fillBatches.forEach((coords, color) => {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      for (let i = 0; i < coords.length; i += 2) {
+        const cx = Math.round(coords[i]);
+        const cy = Math.round(coords[i+1]);
+        const halfW = Math.round(w / 2);
+        const halfH = Math.round(h / 2);
+        ctx.moveTo(cx + halfW, cy);
+        ctx.lineTo(cx + w, cy + halfH);
+        ctx.lineTo(cx + halfW, cy + h);
+        ctx.lineTo(cx, cy + halfH);
+        ctx.closePath();
+      }
+      ctx.fill();
+    });
+
+    // 2. Draw all grid lines (stroke)
+    if (zoom >= 0.6) {
+      ctx.lineWidth = 0.5;
+      strokeBatches.forEach((coords, color) => {
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        for (let i = 0; i < coords.length; i += 2) {
+          const cx = Math.round(coords[i]);
+          const cy = Math.round(coords[i+1]);
+          const halfW = Math.round(w / 2);
+          const halfH = Math.round(h / 2);
+          ctx.moveTo(cx + halfW, cy);
+          ctx.lineTo(cx + w, cy + halfH);
+          ctx.lineTo(cx + halfW, cy + h);
+          ctx.lineTo(cx, cy + halfH);
+          ctx.closePath();
+        }
+        ctx.stroke();
+      });
+    }
+
+    // 3. Draw zone borders
+    if (zoom >= 0.95) {
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 2]);
+      zoneBorderBatches.forEach((coords, color) => {
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        for (let i = 0; i < coords.length; i += 2) {
+          const cx = Math.round(coords[i]);
+          const cy = Math.round(coords[i+1]);
+          const halfW = Math.round(w / 2);
+          const halfH = Math.round(h / 2);
+          ctx.moveTo(cx + halfW, cy);
+          ctx.lineTo(cx + w, cy + halfH);
+          ctx.lineTo(cx + halfW, cy + h);
+          ctx.lineTo(cx, cy + halfH);
+          ctx.closePath();
+        }
+        ctx.stroke();
+      });
+      ctx.setLineDash([]);
+    }
+
+    // 4. Draw highlights
+    if (highlightBatch.length > 0) {
+      // Semi-transparent fill
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
+      ctx.beginPath();
+      for (let i = 0; i < highlightBatch.length; i += 2) {
+        const cx = Math.round(highlightBatch[i]);
+        const cy = Math.round(highlightBatch[i+1]);
+        const halfW = Math.round(w / 2);
+        const halfH = Math.round(h / 2);
+        ctx.moveTo(cx + halfW, cy);
+        ctx.lineTo(cx + w, cy + halfH);
+        ctx.lineTo(cx + halfW, cy + h);
+        ctx.lineTo(cx, cy + halfH);
+        ctx.closePath();
+      }
+      ctx.fill();
+      
+      // White border
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let i = 0; i < highlightBatch.length; i += 2) {
+        const cx = Math.round(highlightBatch[i]);
+        const cy = Math.round(highlightBatch[i+1]);
+        const halfW = Math.round(w / 2);
+        const halfH = Math.round(h / 2);
+        ctx.moveTo(cx + halfW, cy);
+        ctx.lineTo(cx + w, cy + halfH);
+        ctx.lineTo(cx + halfW, cy + h);
+        ctx.lineTo(cx, cy + halfH);
+        ctx.closePath();
+      }
+      ctx.stroke();
+    }
     
     // Draw water sprites (after base tiles, below other buildings)
     // Add clipping to prevent water from overflowing map boundaries
@@ -1771,8 +1869,6 @@ export function CanvasIsometricGrid({ overlayMode, selectedTile, setSelectedTile
     const topRight = gridToScreen(gridSize - 1, 0, 0, 0);
     const bottomRight = gridToScreen(gridSize - 1, gridSize - 1, 0, 0);
     const bottomLeft = gridToScreen(0, gridSize - 1, 0, 0);
-    const w = TILE_WIDTH;
-    const h = TILE_HEIGHT;
     
     // Create clipping path following the outer edges of the map
     // The path goes around the perimeter: top -> right -> bottom -> left -> back to top
@@ -1820,34 +1916,103 @@ export function CanvasIsometricGrid({ overlayMode, selectedTile, setSelectedTile
     }
     
     // PERF: Pre-compute tile dimensions once outside loops
-    const tileWidth = TILE_WIDTH;
-    const tileHeight = TILE_HEIGHT;
-    const halfTileWidth = tileWidth / 2;
-    const halfTileHeight = tileHeight / 2;
+    const tileWidth = Math.round(TILE_WIDTH);
+    const tileHeight = Math.round(TILE_HEIGHT);
+    const halfTileWidth = Math.round(tileWidth / 2);
+    const halfTileHeight = Math.round(tileHeight / 2);
     
     // Draw green base tiles for grass/empty tiles adjacent to water BEFORE bridges
     // This ensures bridge railings are drawn on top of the green base tiles
-    insertionSortByDepth(greenBaseTileQueue);
+    const greenTileGroups = new Map<string, typeof greenBaseTileQueue>();
+    // Group by zone
     for (let i = 0; i < greenBaseTileQueue.length; i++) {
-      const { tile, screenX, screenY } = greenBaseTileQueue[i];
-      drawGreenBaseTile(ctx, screenX, screenY, tile, zoom);
+      const item = greenBaseTileQueue[i];
+      const zone = item.tile.zone;
+      let group = greenTileGroups.get(zone);
+      if (!group) {
+        group = [];
+        greenTileGroups.set(zone, group);
+      }
+      group.push(item);
     }
+    
+    // Draw each group in a single path fill/stroke
+    greenTileGroups.forEach((items, zone) => {
+      const colors = ZONE_COLORS[zone as keyof typeof ZONE_COLORS];
+      const halfW = Math.round(w / 2);
+      const halfH = Math.round(h / 2);
+      
+      // Fill
+      ctx.fillStyle = colors.top;
+      ctx.beginPath();
+      for (let i = 0; i < items.length; i++) {
+        const cx = Math.round(items[i].screenX);
+        const cy = Math.round(items[i].screenY);
+        ctx.moveTo(cx + halfW, cy);
+        ctx.lineTo(cx + w, cy + halfH);
+        ctx.lineTo(cx + halfW, cy + h);
+        ctx.lineTo(cx, cy + halfH);
+        ctx.closePath();
+      }
+      ctx.fill();
+      
+      // Stroke (grid lines)
+      if (zoom >= 0.6) {
+        ctx.strokeStyle = colors.stroke;
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        for (let i = 0; i < items.length; i++) {
+          const cx = Math.round(items[i].screenX);
+          const cy = Math.round(items[i].screenY);
+          ctx.moveTo(cx + halfW, cy);
+          ctx.lineTo(cx + w, cy + halfH);
+          ctx.lineTo(cx + halfW, cy + h);
+          ctx.lineTo(cx, cy + halfH);
+          ctx.closePath();
+        }
+        ctx.stroke();
+      }
+      
+      // Zone borders (dashed)
+      if (zone !== 'none' && zoom >= 0.95) {
+        ctx.strokeStyle = ZONE_BORDER_COLORS[zone as keyof typeof ZONE_BORDER_COLORS];
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 2]);
+        ctx.beginPath();
+        for (let i = 0; i < items.length; i++) {
+          const cx = Math.round(items[i].screenX);
+          const cy = Math.round(items[i].screenY);
+          ctx.moveTo(cx + halfW, cy);
+          ctx.lineTo(cx + w, cy + halfH);
+          ctx.lineTo(cx + halfW, cy + h);
+          ctx.lineTo(cx, cy + halfH);
+          ctx.closePath();
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    });
     
     // Draw roads (above water, needs full redraw including base tile)
     insertionSortByDepth(roadQueue);
+    
+    // PERF: Batch fill all road base tiles in a single draw call
+    ctx.fillStyle = '#4a4a4a';
+    ctx.beginPath();
+    for (let i = 0; i < roadQueue.length; i++) {
+      const cx = Math.round(roadQueue[i].screenX);
+      const cy = Math.round(roadQueue[i].screenY);
+      ctx.moveTo(cx + halfTileWidth, cy);
+      ctx.lineTo(cx + tileWidth, cy + halfTileHeight);
+      ctx.lineTo(cx + halfTileWidth, cy + tileHeight);
+      ctx.lineTo(cx, cy + halfTileHeight);
+      ctx.closePath();
+    }
+    ctx.fill();
+
     // PERF: Use for loop instead of forEach
     for (let i = 0; i < roadQueue.length; i++) {
       const { tile, screenX, screenY } = roadQueue[i];
-      
-      // Draw road base tile first (grey diamond)
-      ctx.fillStyle = '#4a4a4a';
-      ctx.beginPath();
-      ctx.moveTo(screenX + halfTileWidth, screenY);
-      ctx.lineTo(screenX + tileWidth, screenY + halfTileHeight);
-      ctx.lineTo(screenX + halfTileWidth, screenY + tileHeight);
-      ctx.lineTo(screenX, screenY + halfTileHeight);
-      ctx.closePath();
-      ctx.fill();
       
       // Draw road markings and sidewalks
       drawBuilding(ctx, screenX, screenY, tile);
@@ -1873,18 +2038,24 @@ export function CanvasIsometricGrid({ overlayMode, selectedTile, setSelectedTile
     
     // Draw rail tracks (above water, similar to roads)
     insertionSortByDepth(railQueue);
+    
+    // PERF: Batch fill all rail base tiles in a single draw call
+    ctx.fillStyle = '#5B6345'; // Dark gravel color for contrast with ballast
+    ctx.beginPath();
+    for (let i = 0; i < railQueue.length; i++) {
+      const cx = Math.round(railQueue[i].screenX);
+      const cy = Math.round(railQueue[i].screenY);
+      ctx.moveTo(cx + halfTileWidth, cy);
+      ctx.lineTo(cx + tileWidth, cy + halfTileHeight);
+      ctx.lineTo(cx + halfTileWidth, cy + tileHeight);
+      ctx.lineTo(cx, cy + halfTileHeight);
+      ctx.closePath();
+    }
+    ctx.fill();
+
     // PERF: Use for loop instead of forEach
     for (let i = 0; i < railQueue.length; i++) {
       const { tile, screenX, screenY } = railQueue[i];
-      // Draw rail base tile first (dark gravel colored diamond)
-      ctx.fillStyle = '#5B6345'; // Dark gravel color for contrast with ballast
-      ctx.beginPath();
-      ctx.moveTo(screenX + halfTileWidth, screenY);
-      ctx.lineTo(screenX + tileWidth, screenY + halfTileHeight);
-      ctx.lineTo(screenX + halfTileWidth, screenY + tileHeight);
-      ctx.lineTo(screenX, screenY + halfTileHeight);
-      ctx.closePath();
-      ctx.fill();
       
       // Draw edge shading for depth
       ctx.strokeStyle = '#4B5335';
@@ -1901,10 +2072,35 @@ export function CanvasIsometricGrid({ overlayMode, selectedTile, setSelectedTile
     
     // Draw gray building base tiles (after rail, before crossings)
     insertionSortByDepth(baseTileQueue);
-    // PERF: Use for loop instead of forEach
+    
+    // PERF: Batch fill all grey building base tiles in a single draw call
+    ctx.fillStyle = GREY_TILE_COLORS.top;
+    ctx.beginPath();
     for (let i = 0; i < baseTileQueue.length; i++) {
-      const { tile, screenX, screenY } = baseTileQueue[i];
-      drawGreyBaseTile(ctx, screenX, screenY, tile, zoom);
+      const cx = Math.round(baseTileQueue[i].screenX);
+      const cy = Math.round(baseTileQueue[i].screenY);
+      ctx.moveTo(cx + halfTileWidth, cy);
+      ctx.lineTo(cx + tileWidth, cy + halfTileHeight);
+      ctx.lineTo(cx + halfTileWidth, cy + tileHeight);
+      ctx.lineTo(cx, cy + halfTileHeight);
+      ctx.closePath();
+    }
+    ctx.fill();
+    
+    if (zoom >= 0.6) {
+      ctx.strokeStyle = GREY_TILE_COLORS.stroke;
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      for (let i = 0; i < baseTileQueue.length; i++) {
+        const cx = Math.round(baseTileQueue[i].screenX);
+        const cy = Math.round(baseTileQueue[i].screenY);
+        ctx.moveTo(cx + halfTileWidth, cy);
+        ctx.lineTo(cx + tileWidth, cy + halfTileHeight);
+        ctx.lineTo(cx + halfTileWidth, cy + tileHeight);
+        ctx.lineTo(cx, cy + halfTileHeight);
+        ctx.closePath();
+      }
+      ctx.stroke();
     }
     
     // Draw suspension bridge towers AGAIN on main canvas after base tiles
@@ -1973,10 +2169,6 @@ export function CanvasIsometricGrid({ overlayMode, selectedTile, setSelectedTile
     // Render buildings on the buildings canvas (on top of cars/trains)
     const buildingsCanvas = buildingsCanvasRef.current;
     if (buildingsCanvas) {
-      // Set canvas size in memory (scaled for DPI)
-      buildingsCanvas.width = canvasSize.width;
-      buildingsCanvas.height = canvasSize.height;
-      
       const buildingsCtx = buildingsCanvas.getContext('2d');
       if (buildingsCtx) {
         // Clear buildings canvas

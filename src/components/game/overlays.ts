@@ -190,11 +190,12 @@ export function getOverlayFillStyle(
         ? 'rgba(245, 158, 11, 0.7)'  // Bright amber for existing subway
         : 'rgba(40, 30, 20, 0.4)';   // Dark brown tint for "underground" view
 
-    case 'pollution':
+    case 'pollution': {
       if (tile.pollution <= 0.1) return NO_OVERLAY;
       // Smog opacity scales with pollution intensity (brown-grey color)
       const alpha = Math.min(0.65, Math.max(0.15, tile.pollution / 60));
       return `rgba(139, 115, 85, ${alpha})`;
+    }
 
     case 'none':
     default:
